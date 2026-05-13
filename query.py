@@ -2,7 +2,14 @@
 
 Retrieval: dense embeddings (Chroma) + optional BM25 sidecar with RRF fusion (see hybrid_retrieval).
 LLM routing: ``RAG_LLM_BACKEND`` (auto|groq|gemini|ollama|openai); keys from ``.env`` (see llm_providers).
+When ``RAG_LLM_BACKEND=groq`` and Groq returns 429/503/413, answers fall back to Gemini if a key is set
+(``GEMINI_API_KEY`` or ``GOOGLE_API_KEY`` / ``GENAI_API_KEY``; ``GROQ_GEMINI_FALLBACK=0`` disables).
+Hosted prompts are capped (``RAG_HOSTED_MESSAGES_MAX_CHARS``, default 26000) to reduce Groq 413.
 Optional web/tools: rag_tools/augment.py. Optional dynamic_layer JSONL via ingest.
+System prompt adds grounded recommendations and cautious predictions; disable with ``RAG_ADVISOR_PLAYBOOK=0``.
+Hosted chat sends only the last ``RAG_HOSTED_CHAT_ROUNDS`` Q/A pairs (default 3) to save API tokens; ``0`` = unlimited.
+When Groq/Gemini/OpenAI fail (e.g. 429), local Ollama is used if ``RAG_HOSTED_FALLBACK_OLLAMA=1`` (default) and ``USE_OLLAMA=1``.
+Set ``RAG_LOCAL_FIRST=1`` for auto routing to Ollama before cloud APIs.
 """
 
 from __future__ import annotations
@@ -22,8 +29,8 @@ from embeddings import encode_query
 from llm_providers import (
     effective_llm_backend,
     gemini_chat_messages,
-    groq_chat_messages,
-    iter_groq_chat,
+    groq_chat_messages_with_gemini_fallback,
+    iter_groq_chat_with_gemini_fallback,
     load_dotenv_if_present,
     openai_style_chat,
 )
@@ -61,6 +68,27 @@ STAY_ON_TOPIC_AM = (
     " ስለ ጥያቄው ርዕስ ብቻ መልስ። ከመመሪያው ሌሎች ሰብሎች ወይም ርዕሶች ካልተጠየቁ አትጨምር። "
     "ተጨማሪ ከሆነ በተመሳሳይ ርዕስ ላይ ብቻ በአጭር ይሁን። ጥያቄውን እንደ መልስ አታድግም።"
 )
+# Direct voice + one suggested next question (not the same as multi-turn «follow_up» in system_for_rag).
+DIRECT_ANSWER_AND_FOLLOWUP_AM = (
+    " መልስህን በቀጥታ እውቀት ጀምር። «መረጃው እንደሚለው»፣ «መረጃው»፣ «ከላይ»፣ «በመመሪያው» "
+    "የመጀመሪያ መስመር አትጨምር። "
+    "የመልስ ክፍልዎን በማጠናቀቅ ከመልስ በኋላ ባዶ መስመር አድርገው አንድ ብቻ ተዛማጅ ተጨማሪ ጥያቄ በአማርኛ ጻፍ "
+    "(ለምሳሌ ስለ ዝናብ፣ ዝርያ፣ ወይም ማዳበሪያ)።"
+)
+# Grounded advisor: recommendations + cautious predictions (disable with RAG_ADVISOR_PLAYBOOK=0).
+ADVISOR_PLAYBOOK_AM = (
+    " ለገበሬው እንደ ብቁ አማካሪ አስብ፦ በመጀመሪያ ከላይ ካለው መመሪያ ውስጥ ያለውን አውጣ፤ ከዚያ "
+    "በተግባር ሊሰሩ የሚችሉ ምክሮችና ቅድሚያ የሚሰጡ እርምጃዎች በአጭር ዝርዝር ስጥ። "
+    "የወደፊት ውጤት፣ የበለጠ መልካም መስፈን ወይም ስጋት (prediction) ከመረጃው ሲደገፍ በግልጽ ተናገር፤ "
+    "አካባቢ፣ ዝናብ፣ መሬት ወይም ዝርያ ካልታወቀ በግልጽ «ይህ በተለዋዋጭ ሁኔታ ላይ የተመረኰተ ግምት ነው» በማለት አሳስብ። "
+    "ከመመሪያው ውጭ ያለውን እንደ ተረጋገጠ እውቀት አታقدር። "
+    "ለመርዝ፣ ለዕጣዕጅ መድሃኒት፣ ለእንስሳ ጤና ቀውስ፣ ለሕጋዊ ወይም ለገንዘብ ውሳኔ ከአካባቢ ማራዝሚያ ወይም ባለሙያ "
+    "እንዲጠየቅ በአንድ አጭር ሐረግ አስታውቅ።"
+)
+ADVISOR_PLAYBOOK_AM_FAST = (
+    " ከመረጃው ጀምሮ ቀጥታ ምክርና እርምጃዎች ስጥ። ትንቢት/ግምት ከመረጃው በላይ ከሆነ በግልጽ እንደ ግምት አሳስብ። "
+    "ለመርዝ/ዕጣዕጅ/እንስሳ ቀውስ ከባለሙያ ያማካኙ።"
+)
 
 
 def system_for_rag(
@@ -70,7 +98,14 @@ def system_for_rag(
     follow_up: bool = False,
     nlu: FarmerNLU | None = None,
 ) -> str:
-    base = (SYSTEM_AM_FAST if fast else SYSTEM_AM) + STAY_ON_TOPIC_AM
+    base = (SYSTEM_AM_FAST if fast else SYSTEM_AM) + STAY_ON_TOPIC_AM + DIRECT_ANSWER_AND_FOLLOWUP_AM
+    if os.environ.get("RAG_ADVISOR_PLAYBOOK", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        base += ADVISOR_PLAYBOOK_AM_FAST if fast else ADVISOR_PLAYBOOK_AM
     base = base + nlu_answer_scope_hint(nlu)
     if has_aux_context:
         base = base + SYSTEM_AUX_WEB
@@ -211,15 +246,32 @@ def build_context(chunks: list[dict], max_chars: int, *, compact: bool = False) 
     return "\n".join(parts).strip()
 
 
+def _strip_answer_meta_openers(text: str) -> str:
+    """Drop leading phrases like «መረጃው እንደሚለው …»."""
+    lines = text.splitlines()
+    if not lines:
+        return text
+    first = lines[0].strip()
+    first = re.sub(
+        r"^(?:መረጃው\s*እንደሚለው|መረጃው\s+እንደሚለው|እንደ\s*መረጃው|በመረጃው\s+መሰረት)\s*[፦:.\s]*",
+        "",
+        first,
+        flags=re.IGNORECASE,
+    ).lstrip()
+    lines[0] = first
+    return "\n".join(lines).strip()
+
+
 def sanitize_chat_answer(text: str | None) -> str:
-    """Remove «ምንጭ: file» lines and echoed RAG instructions from model output."""
+    """Remove «ምንጭ: file» lines, meta openers, and echoed RAG instructions from model output."""
     if not text or not str(text).strip():
         return (text or "").strip()
     t0 = text.strip()
     if re.match(r"^\[(?:groq|gemini|ollama|openai)\]", t0, re.I) or t0.startswith("[Ollama]"):
         return t0
+    t0 = _strip_answer_meta_openers(t0)
     out: list[str] = []
-    for line in text.splitlines():
+    for line in t0.splitlines():
         s = line.strip()
         if re.match(r"^ምንጭ\s*[:፦]", s):
             continue
@@ -629,6 +681,67 @@ def build_rag_pack(
     }
 
 
+def _hosted_chat_rounds_limit() -> int:
+    """Max prior user/assistant *pairs* sent to Groq/Gemini/OpenAI. ``0`` / ``off`` = unlimited."""
+    v = os.environ.get("RAG_HOSTED_CHAT_ROUNDS", "3").strip().lower()
+    if not v or v in ("0", "off", "unlimited", "no", "false"):
+        return 0
+    try:
+        return max(0, int(v))
+    except ValueError:
+        return 3
+
+
+def trim_hosted_conversation_messages(messages: list[dict]) -> list[dict]:
+    """Keep system + last N Q/A turns + final RAG user message (reduces token quota burn)."""
+    if len(messages) <= 2:
+        return messages
+    if (messages[0].get("role") or "") != "system":
+        return messages
+    limit = _hosted_chat_rounds_limit()
+    if limit == 0:
+        return messages
+    system = messages[0]
+    tail = messages[-1]
+    mid = messages[1:-1]
+    max_mid = limit * 2
+    if len(mid) <= max_mid:
+        return messages
+    return [system] + mid[-max_mid:] + [tail]
+
+
+def _hosted_ollama_fallback_enabled() -> bool:
+    if os.environ.get("RAG_HOSTED_FALLBACK_OLLAMA", "1").strip().lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        return False
+    return os.environ.get("USE_OLLAMA", "1").strip().lower() in ("1", "true", "yes")
+
+
+def _ollama_failover_answer(msgs: list[dict], fast: bool) -> str:
+    base = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
+    model = default_chat_model(fast)
+    opts = ollama_options(fast)
+    timeout = float(os.environ.get("OLLAMA_HTTP_TIMEOUT", "120" if fast else "300"))
+    return ollama_chat_messages(msgs, model, base, options=opts, timeout_sec=timeout)
+
+
+def _prepare_llm_messages(
+    system: str,
+    conversation: list[dict] | None,
+    user_block: str,
+    backend: str,
+) -> list[dict]:
+    msgs = _ollama_messages(system, conversation, user_block)
+    if backend in ("groq", "gemini", "openai"):
+        msgs = trim_hosted_conversation_messages(msgs)
+        msgs = shrink_messages_for_hosted_api(msgs)
+    return msgs
+
+
 def _ollama_messages(
     system: str,
     conversation: list[dict] | None,
@@ -647,6 +760,43 @@ def _ollama_messages(
             messages.append({"role": role, "content": c[:12000]})
     messages.append({"role": "user", "content": user_block})
     return messages
+
+
+def shrink_messages_for_hosted_api(messages: list[dict]) -> list[dict]:
+    """Cap total characters to reduce Groq/OpenAI 413 (payload too large) on long RAG + chat."""
+    cap = max(12_000, int(os.environ.get("RAG_HOSTED_MESSAGES_MAX_CHARS", "26000")))
+    mark = "\n\n…(ለ API መጠን ተሰነዘለ)…"
+    out: list[dict] = [{"role": m["role"], "content": str(m.get("content") or "")} for m in messages]
+
+    def total() -> int:
+        return sum(len(x["content"]) for x in out)
+
+    for _ in range(32):
+        if total() <= cap:
+            return out
+        over = total() - cap + len(mark) + 40
+        cut_idx: int | None = None
+        for idx in range(len(out) - 1, -1, -1):
+            if out[idx]["role"] not in ("user", "assistant"):
+                continue
+            c = out[idx]["content"]
+            if len(c) < 2800:
+                continue
+            cut_idx = idx
+            break
+        if cut_idx is not None:
+            c = out[cut_idx]["content"]
+            new_len = max(2500, len(c) - max(over, int(0.12 * len(c))))
+            out[cut_idx]["content"] = c[:new_len].rstrip() + mark
+            continue
+        # Short users only: trim longest message (often system or last user)
+        li = max(range(len(out)), key=lambda i: len(out[i]["content"]))
+        c = out[li]["content"]
+        if len(c) <= 1800:
+            break
+        new_len = max(1500, len(c) - over)
+        out[li]["content"] = c[:new_len].rstrip() + mark
+    return out
 
 
 def ollama_chat_messages(
@@ -806,14 +956,17 @@ def run_query(
         follow_up=bool(conversation),
         nlu=parse_farmer_nlu(question),
     )
-    msgs = _ollama_messages(system, conversation, user_block)
     backend = effective_llm_backend()
+    msgs = _prepare_llm_messages(system, conversation, user_block, backend)
     answer = ""
+    llm_used = backend
     hosted_timeout = float(os.environ.get("RAG_HOSTED_HTTP_TIMEOUT", "120" if fast else "240"))
 
     try:
         if backend == "groq":
-            answer = groq_chat_messages(msgs, fast=fast, timeout_sec=hosted_timeout)
+            answer, llm_used = groq_chat_messages_with_gemini_fallback(
+                msgs, fast=fast, timeout_sec=hosted_timeout
+            )
         elif backend == "gemini":
             answer = gemini_chat_messages(msgs, fast=fast, timeout_sec=hosted_timeout)
         elif backend == "openai":
@@ -848,7 +1001,14 @@ def run_query(
                 except RuntimeError as e:
                     answer = f"[Ollama]\n{e}"
     except Exception as e:
-        answer = f"[{backend}]\n{e}"
+        if backend in ("groq", "gemini", "openai") and _hosted_ollama_fallback_enabled():
+            try:
+                answer = _ollama_failover_answer(msgs, fast)
+                llm_used = "ollama"
+            except Exception as fe:
+                answer = f"[{backend}]\n{e}\n[Ollama]\n{fe}"
+        else:
+            answer = f"[{backend}]\n{e}"
 
     answer = sanitize_chat_answer(answer)
 
@@ -857,7 +1017,7 @@ def run_query(
         "answer": answer,
         "retrieval": pack["retrieval"],
         "tool_trace": pack.get("tool_trace") or [],
-        "llm_backend": backend,
+        "llm_backend": llm_used,
         "nlu": pack.get("nlu"),
     }
     rq_used = (pack.get("retrieval_query") or "").strip()
@@ -895,12 +1055,14 @@ def stream_rag_answer(
             follow_up=bool(conversation),
             nlu=parse_farmer_nlu(question),
         )
-        msgs = _ollama_messages(system, conversation, user_block)
         backend = effective_llm_backend()
+        msgs = _prepare_llm_messages(system, conversation, user_block, backend)
         hosted_timeout = float(os.environ.get("RAG_HOSTED_HTTP_TIMEOUT", "120" if fast else "240"))
         try:
             if backend == "groq":
-                yield from iter_groq_chat(msgs, fast=fast, timeout_sec=hosted_timeout)
+                yield from iter_groq_chat_with_gemini_fallback(
+                    msgs, fast=fast, timeout_sec=hosted_timeout
+                )
             elif backend == "gemini":
                 yield gemini_chat_messages(msgs, fast=fast, timeout_sec=hosted_timeout)
             elif backend == "openai":
@@ -932,6 +1094,19 @@ def stream_rag_answer(
                 except (RuntimeError, httpx.HTTPError, httpx.RequestError) as e:
                     yield f"[Ollama]\n{e}"
         except Exception as e:
+            if backend in ("groq", "gemini", "openai") and _hosted_ollama_fallback_enabled():
+                try:
+                    base = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
+                    model = default_chat_model(fast)
+                    opts = ollama_options(fast)
+                    timeout = float(os.environ.get("OLLAMA_HTTP_TIMEOUT", "120" if fast else "300"))
+                    yield from iter_ollama_chat(
+                        msgs, model, base, options=opts, timeout_sec=timeout
+                    )
+                    return
+                except Exception as fe:
+                    yield f"[{backend}]\n{e}\n[Ollama]\n{fe}"
+                    return
             yield f"[{backend}]\n{e}"
 
     return sources, pack["retrieval"], _gen

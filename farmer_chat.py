@@ -67,7 +67,10 @@ def _render_message(msg: dict) -> None:
 
 with st.sidebar:
     st.header("⚙️ ማስተካከያ")
-    st.caption(f"LLM: **{effective_llm_backend()}** · `RAG_LLM_BACKEND` (auto=groq→gemini→ollama)")
+    st.caption(
+        f"LLM: **{effective_llm_backend()}** · `RAG_LLM_BACKEND` (auto፡ Groq→Gemini፤ ከ429/503 በኋላ **Ollama** ይሞክራል ከተጫነ። "
+        "`RAG_LOCAL_FIRST=1` ከሆነ በመጀመሪያ **Ollama**። Groq 429 → Gemini → (ስህተት) Ollama።"
+    )
     quality = st.toggle(
         "ጥራት ቅድሚያ (የበለጠ ዝርዝር መልስ፣ ቀርጥፍ ይሆናል)",
         value=False,
@@ -97,9 +100,11 @@ with st.sidebar:
     st.markdown(
         "**ማስታወሻ**\n\n"
         "• ዋናው መረጃ ከመመሪያ እና ከጥያቄ-መልስ ቤት ነው።\n\n"
+        "• መልሶች **ምክር** እና **የወደፊት ግምት** ሊያካትቱ ይችላሉ፤ ከመመሪያው ሲደገፉ ብቻ በጥንቃቄ ይሰጣሉ።\n\n"
         "• `!web ፍለጋ` ወይም `!weather Addis Ababa` ለውጫዊ እውቀት።\n\n"
-        "• ለህክምና ዕውቀት ብቻ ነው — ከመስክ ባለሙያ ያማካኙ።\n\n"
-        "• **Groq / Gemini** ካለ `.env` ውስጥ ቁልፍ፣ በነባሪው ከ Ollama በፊት ይጠቀማሉ።\n\n"
+        "• ለመርዝ፣ ለዕጣዕጅ፣ ለእንስሳ ቀውስ ወይም ለሕጋዊ/ገንዘብ ውሳኔ ከአካባቢ ማራዝሚያ ወይም ባለሙያ ያማካኙ።\n\n"
+        "• **HTTP 429** የየኔት ወሰን/ኮታ ነው (428 አይደለም)። ታሪክ + መመሪያ ቶከን ያቃጣል — `RAG_HOSTED_CHAT_ROUNDS` ነባሪ **3** ዙር ብቻ ወደ API ይላካል፤ ለረጅም ውይይት ቁጥሩን ይጨምሩ (`0` = ሁሉንም)።\n\n"
+        "• ከAPI ውጭ፡ `RAG_LLM_BACKEND=ollama` ወይም `RAG_LOCAL_FIRST=1`። Groq/Gemini ከወሰኑ በኋላ **Ollama** አውቶማቲክ ይሞክራል (`RAG_HOSTED_FALLBACK_OLLAMA=1`)።\n\n"
         "• ለአካባቢ **Ollama** `qwen2.5:3b` / `qwen3:4b-instruct` ይጫኑ።"
     )
     if st.button("ውይይት አጽዳ", type="secondary"):
@@ -109,7 +114,8 @@ with st.sidebar:
 st.title("🌾 የግብርና ረዳት")
 st.caption(
     "ስለ ሰብል፣ መሬት፣ ዝናብ፣ ድህረ-ምርት እና ተዛማጅ ጥያቄዎች በአማርኛ ይጠይቁ። "
-    "መልሶች በመጀመሪያ ከየእኛ መመሪያ ቤት ናቸው፤ ከበስተኛው ድር/መሳሪያ ሲከፈት ተጨማሪ ምንጮች ይጨመራሉ።"
+    "መልሶች በመጀመሪያ ከመመሪያ ቤታችን ይደገፋሉ፤ **ምክር፣ የሚከናወኑ እርምጃዎች** እና አስፈላጊ ሲሆን **በጥንቃቄ የተገመተ ውጤት** "
+    "ይሰጣሉ። ከበስተኛው ድር/መሳሪያ ሲከፈት ተጨማሪ ምንጮች ይጨመራሉ።"
 )
 
 for m in st.session_state.messages:
@@ -118,7 +124,7 @@ for m in st.session_state.messages:
 if not st.session_state.messages:
     st.info(
         "ምሳሌ ጥያቄዎች፦ **ስንዴ ለማምረት ምን ያህል ዝናብ ያስፈልጋል?** "
-        "ወይም **የተፈጥሮ ማዳበሪያ ምን ይጠቅማል?** ከታች ይጻፉ።"
+        "**በዚህ ወቅት ምን ማድረግ ይመራል?** ወይም **የተፈጥሮ ማዳበሪያ ምን ይጠቅማል?** ከታች ይጻፉ።"
     )
 
 prompt = st.chat_input("ጥያቄዎን እዚህ ይጻፉ…")
