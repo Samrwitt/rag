@@ -1,0 +1,6 @@
+{"id": "kb-nutrients", "question": "አብዛኛው የኢትዮጵያ አፈር ለየትኞቹ ሦስት ንጥረ ነገሮች ነው ምላሽ የሚሰጠው?", "hits_must_contain_any": ["ናይትሮጅን", "ፎስፎረስ", "ሰልፈር"], "answer_keywords": ["ናይትሮጅ"]}
+{"id": "kb-nps", "question": "ምክረ-ሃሳብ ላልወጣላቸው አካባቢዎች በሄክታር ምን ያህል ኤን.ፒ.ኤስ (NPS) ማዳበሪያ መጠቀም ይቻላል?", "hits_must_contain_any": ["ኩንታል", "NPS", "1-1.5"], "answer_keywords": ["1", "1.5"]}
+{"id": "kb-urea-schedule", "question": "የዩሪያ ማዳበሪያን አጠቃቀም የጊዜ ሰሌዳ እንዴት መሆን አለበት?", "hits_must_contain_any": ["ዩሪያ", "35", "40"], "answer_keywords": ["35"]}
+{"id": "kb-wheat-altitude", "question": "ስንዴ ለማምረት ይበልጥ ተስማሚ የሆነው የከፍታ መጠን ስንት ነው?", "hits_must_contain_any": ["1800", "2800", "ሜትር"], "answer_keywords": ["1800"]}
+{"id": "kb-wheat-temp", "question": "ለስንዴ ሰብል ተስማሚ የሆነው አማካይ የሙቀት መጠን ስንት ነው?", "hits_must_contain_any": ["15", "25", "ሴልሽየስ"], "answer_keywords": ["15"]}
+{"id": "web-smoke", "question": "!web Open-Meteo API", "skip_retrieval": true, "answer_keywords": []}
