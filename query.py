@@ -27,6 +27,12 @@ from llm_providers import (
     load_dotenv_if_present,
     openai_style_chat,
 )
+from nlu_farmer import (
+    FarmerNLU,
+    augment_retrieval_query_with_nlu,
+    nlu_answer_scope_hint,
+    parse_farmer_nlu,
+)
 from qa_context import qa_context_text
 from rag_tools import augment_kb_context
 
@@ -36,24 +42,36 @@ load_dotenv_if_present()
 SYSTEM_AM = (
     "አንተ የኢትዮጵያ ግብርና እና የተፈጥሮ ሀብት ባለሙያ አማካሪ ነህ። "
     "የተሰጠህን መረጃ ብቻ በመጠቀም በአማርኛ ግልጽና ትክክለኛ መልስ ስጥ። "
-    "ከመረጃው ውጭ ከሆነ በግልጽ 'በዚህ መረጃ ውስጥ መልስ አልተገኘም' በማለት ግልጽ አድርግ። "
-    "የእያንዳንዱን ክፍል ምንጭ በመግለጽ በቁጥር ጥቅስ (ለምሳሌ፦ «…» [1])።"
+    "ጥያቄውን እንደ መልስ አታድግም፤ ከመረጃው ቁልፍ ቁጥሮችንና እውቀትን አውጣ። "
+    "መልስህ ለተጠቃሚ ቀጥታ የሚነገር ነገር ብቻ ይሁን። የፋይል ስም፣ «ምንጭ፡» ወይም የዚህ ቻት መመሪያ መስመር በመልስ ውስጥ አትጨምር። "
+    "ከመረጃው ውጭ ከሆነ በግልጽ 'በዚህ መረጃ ውስጥ መልስ አልተገኘም' በማለት ግልጽ አድርግ።"
 )
 SYSTEM_AM_FAST = (
     "በአማርኛ ቀጥተኛ መልስ ስጥ። የተሰጠውን መረጃ ብቻ ተጠቀም። ከውጭ ከሆነ በግልጽ ብቻ ንገር። "
-    "ጥያቄውን በሙሉ በአማርኛ ግልጽ አብራራ። ምንጭ ካስፈለገ በመጨረሻ አጭር ጥቅስ ከ [1] ወይም [2] ከላይ ካለው ክፍል ጋር አጣምር። "
+    "ጥያቄውን እንደ መልስ አታድግም፤ ከመረጃው ቁልፍ ቁጥሮችንና እውቀትን በግልጽ አውጣ። "
+    "መልስህ ለገበሬው ቀጥታ የሚነገር ነገር ብቻ ይሁን። የፋይል ስም፣ «ምንጭ፡» ወይም የዚህ ቻት መመሪያ መስመር በመልስ ውስጥ አትጨምር። "
     "የሰንጠረይ፣ |፣ ^፣ [[፣ ወይም ረዥም የቁጥር ዝርዝሮችን አትጻፍ።"
 )
 SYSTEM_AUX_WEB = (
     " ከ[1] የሚጀመሩ ክፍሎች ከየእኛ መመሪያ ቤት ናቸው። [W1] … ከድር ወይም ከመሳሪያ ሲሆኑ "
     "አስቀድመህ የመመሪያውን መልስ አረጋግጥ፤ የድርን መረጃ በጥንቃቄ ተጠቀም።"
 )
+# Scope: same topic only; do not dump other crops. Must still extract facts, not echo the question.
+STAY_ON_TOPIC_AM = (
+    " ስለ ጥያቄው ርዕስ ብቻ መልስ። ከመመሪያው ሌሎች ሰብሎች ወይም ርዕሶች ካልተጠየቁ አትጨምር። "
+    "ተጨማሪ ከሆነ በተመሳሳይ ርዕስ ላይ ብቻ በአጭር ይሁን። ጥያቄውን እንደ መልስ አታድግም።"
+)
 
 
 def system_for_rag(
-    fast: bool, *, has_aux_context: bool, follow_up: bool = False
+    fast: bool,
+    *,
+    has_aux_context: bool,
+    follow_up: bool = False,
+    nlu: FarmerNLU | None = None,
 ) -> str:
-    base = SYSTEM_AM_FAST if fast else SYSTEM_AM
+    base = (SYSTEM_AM_FAST if fast else SYSTEM_AM) + STAY_ON_TOPIC_AM
+    base = base + nlu_answer_scope_hint(nlu)
     if has_aux_context:
         base = base + SYSTEM_AUX_WEB
     if follow_up:
@@ -175,24 +193,42 @@ def retrieve(
 
 
 def build_context(chunks: list[dict], max_chars: int, *, compact: bool = False) -> str:
+    """Chunk headers use [n] only — filenames live in metadata / UI, not in LLM-visible text."""
     parts: list[str] = []
     n = 0
     for i, c in enumerate(chunks, 1):
         meta = c["meta"]
-        src = meta.get("source", "?")
         kind = meta.get("kind", "")
         page = meta.get("page", "")
-        head = f"[{i}] ምንጭ: {src}"
-        if kind == "pdf" and page:
+        head = f"[{i}]"
+        if kind == "pdf" and page and not compact:
             head += f" ገጽ {page}"
-        if not compact:
-            head += f" — ለመልስ: [{i}]"
         block = f"{head}\n{c['text']}\n"
         if n + len(block) > max_chars:
             break
         parts.append(block)
         n += len(block)
     return "\n".join(parts).strip()
+
+
+def sanitize_chat_answer(text: str | None) -> str:
+    """Remove «ምንጭ: file» lines and echoed RAG instructions from model output."""
+    if not text or not str(text).strip():
+        return (text or "").strip()
+    t0 = text.strip()
+    if re.match(r"^\[(?:groq|gemini|ollama|openai)\]", t0, re.I) or t0.startswith("[Ollama]"):
+        return t0
+    out: list[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if re.match(r"^ምንጭ\s*[:፦]", s):
+            continue
+        if "ከላይ ካለው መረጃ ቁጥር" in s and ("አውጣ" in s or "አታድግም" in s):
+            continue
+        out.append(line)
+    joined = "\n".join(out).strip()
+    joined = re.sub(r"\n{3,}", "\n\n", joined).strip()
+    return joined
 
 
 def format_source_rows(hits: list[dict]) -> list[dict]:
@@ -296,7 +332,176 @@ def rerank_hits_by_question_overlap(query_for_overlap: str, hits: list[dict]) ->
     return [h for _, h in indexed]
 
 
-def boost_hits_by_topic_keywords(question: str, hits: list[dict]) -> list[dict]:
+# Crop rules: triggers (in user question), needles (must appear in chunk to be «about» that crop),
+# rivals (other crops — demoted when the question names a crop but the chunk is only about a rival).
+_CROP_TOPIC_RULES: tuple[dict[str, tuple[str, ...]], ...] = (
+    {
+        "id": "coffee",
+        "triggers": ("ለቡና", "ቡና", "ቡናን"),
+        "needles": (
+            "ቡና",
+            "ለቡና",
+            "ጎማ",
+            "coffee",
+            "አረቢካ",
+            "አረብካ",
+            "ሮቡስታ",
+            "አራቢካ",
+        ),
+        "rivals": ("ስንዴ", "ለስንዴ", "wheat", "ሰሊጥ", "ሰሊት", "ገብስ", "ቴፍ", "teff"),
+    },
+    {
+        "id": "wheat",
+        "triggers": ("ስንዴ",),
+        "needles": ("ስንዴ", "wheat"),
+        "rivals": ("ቡና", "ለቡና", "coffee", "ሰሊጥ", "ገብስ"),
+    },
+    {
+        "id": "sesame",
+        "triggers": ("ሰሊጥ", "ሰሊት"),
+        "needles": ("ሰሊጥ", "ሰሊት", "sesame"),
+        "rivals": ("ስንዴ", "ቡና", "ለቡና", "ገብስ"),
+    },
+    {
+        "id": "barley",
+        "triggers": ("ገብስ",),
+        "needles": ("ገብስ", "barley"),
+        "rivals": ("ስንዴ", "ቡና", "ለቡና"),
+    },
+    {
+        "id": "faba",
+        "triggers": ("ቡቃያ",),
+        "needles": ("ቡቃያ",),
+        "rivals": ("ስንዴ", "ቡና", "ለቡና"),
+    },
+    {
+        "id": "potato",
+        "triggers": ("ድንች",),
+        "needles": ("ድንች", "potato"),
+        "rivals": ("ስንዴ", "ቡና", "ለቡና"),
+    },
+)
+
+
+def _match_crop_topic_rule(question: str) -> dict[str, tuple[str, ...]] | None:
+    q = question or ""
+    for row in _CROP_TOPIC_RULES:
+        if any(t in q for t in row["triggers"]):
+            return row
+    return None
+
+
+def _crop_rule_by_id(crop_id: str | None) -> dict[str, tuple[str, ...]] | None:
+    if not crop_id:
+        return None
+    for row in _CROP_TOPIC_RULES:
+        if row.get("id") == crop_id:
+            return row
+    return None
+
+
+def effective_crop_topic_rule(question: str, nlu: FarmerNLU) -> dict[str, tuple[str, ...]] | None:
+    """Prefer NLU crop id, else substring triggers in the raw question."""
+    r = _crop_rule_by_id(nlu.crop_id)
+    if r:
+        return r
+    return _match_crop_topic_rule(question)
+
+
+def _crop_row_matches_question(
+    row: dict[str, tuple[str, ...]],
+    question: str,
+    nlu: FarmerNLU,
+) -> bool:
+    if nlu.crop_id and row.get("id") == nlu.crop_id:
+        return True
+    return any(t in question for t in row["triggers"])
+
+
+def _retrieval_blob(h: dict) -> str:
+    m = h.get("meta") or {}
+    return ((h.get("text") or "") + " " + str(m.get("question") or "")).strip()
+
+
+def _dedupe_hits_preserve_order(hits: list[dict]) -> list[dict]:
+    seen: set[str] = set()
+    out: list[dict] = []
+    for h in hits:
+        m = h.get("meta") or {}
+        key = f"{m.get('source', '')}\0{m.get('page', '')}\0{(h.get('text') or '')[:240]}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(h)
+    return out
+
+
+def _topic_good_count(question: str, hits: list[dict], nlu: FarmerNLU) -> int:
+    row = effective_crop_topic_rule(question, nlu)
+    if not row:
+        return len(hits)
+    needles = row["needles"]
+    return sum(1 for h in hits if any(n in _retrieval_blob(h) for n in needles))
+
+
+def filter_cross_crop_hits(question: str, hits: list[dict], nlu: FarmerNLU) -> list[dict]:
+    """Demote chunks about a rival crop when the question names a specific crop (local KB only)."""
+    if not hits or os.environ.get("RAG_TOPIC_FILTER", "1").strip().lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        return hits
+    row = effective_crop_topic_rule(question, nlu)
+    if not row:
+        return hits
+    needles, rivals = row["needles"], row["rivals"]
+    good: list[dict] = []
+    neutral: list[dict] = []
+    bad: list[dict] = []
+    for h in hits:
+        b = _retrieval_blob(h)
+        has_needle = any(n in b for n in needles)
+        has_rival = any(r in b for r in rivals)
+        if has_needle:
+            good.append(h)
+        elif has_rival:
+            bad.append(h)
+        else:
+            neutral.append(h)
+    if good:
+        return good + neutral + bad
+    return neutral + bad
+
+
+def topic_vector_refine_retrieve(
+    rq_boost: str,
+    collection,
+    embed_model: str | None,
+    db: Path | None,
+    pool_k: int,
+    hits: list[dict],
+) -> list[dict]:
+    """Second Chroma vector/hybrid pass with an embedding query augmented by crop keywords."""
+    if os.environ.get("RAG_TOPIC_VECTOR_REFINE", "1").strip().lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        return hits
+    try:
+        extra = retrieve(collection, rq_boost, top_k=pool_k, embed_model=embed_model, db=db)
+    except Exception as e:
+        print(f"Warning: topic vector refine retrieve failed: {e}", file=sys.stderr)
+        return hits
+    return _dedupe_hits_preserve_order(extra + hits)
+
+
+def boost_hits_by_topic_keywords(
+    question: str, hits: list[dict], nlu: FarmerNLU
+) -> list[dict]:
     """Move crop/topic-specific chunks first when the question names a crop (Amharic)."""
     if not hits or os.environ.get("RAG_TOPIC_BOOST", "1").strip().lower() in (
         "0",
@@ -306,23 +511,14 @@ def boost_hits_by_topic_keywords(question: str, hits: list[dict]) -> list[dict]:
     ):
         return hits
     q = question or ""
-    # (any of these in question) -> chunk must contain at least one needle to be "on-topic"
-    rules: list[tuple[tuple[str, ...], tuple[str, ...]]] = [
-        (("ለቡና", "ቡና", "ቡናን"), ("ቡና", "ለቡና", "ጎማ", "coffee")),
-        (("ስንዴ",), ("ስንዴ", "wheat")),
-        (("ሰሊጥ", "ሰሊት"), ("ሰሊጥ", "ሰሊት", "sesame")),
-        (("ገብስ",), ("ገብስ", "barley")),
-        (("ቡቃያ",), ("ቡቃያ",)),
-        (("ድንች",), ("ድንች", "potato")),
-    ]
-    for triggers, needles in rules:
-        if not any(t in q for t in triggers):
+    for row in _CROP_TOPIC_RULES:
+        if not _crop_row_matches_question(row, q, nlu):
             continue
+        needles = row["needles"]
         on_topic: list[dict] = []
         rest: list[dict] = []
         for h in hits:
-            meta = h.get("meta") or {}
-            blob = (h.get("text") or "") + " " + str(meta.get("question") or "")
+            blob = _retrieval_blob(h)
             if any(n in blob for n in needles):
                 on_topic.append(h)
             else:
@@ -330,6 +526,52 @@ def boost_hits_by_topic_keywords(question: str, hits: list[dict]) -> list[dict]:
         if on_topic:
             return on_topic + rest
     return hits
+
+
+def retrieve_ranked_hits(
+    question: str,
+    collection,
+    db: Path,
+    top_k: int,
+    embed_model: str | None,
+    conversation: list[dict] | None,
+    nlu: FarmerNLU,
+) -> tuple[list[dict], str]:
+    """Chroma vector/hybrid retrieval + rerank + crop filter; optional second pass if pool has no crop match."""
+    rq = augment_retrieval_query_with_nlu(
+        retrieval_query_for(question, conversation), nlu
+    )
+    mult = max(1, int(os.environ.get("RAG_RETRIEVE_POOL_MULT", "4")))
+    cap = max(8, int(os.environ.get("RAG_RETRIEVE_POOL_MAX", "48")))
+    pool_k = min(cap, max(top_k, top_k * mult))
+
+    hits = retrieve(collection, rq, top_k=pool_k, embed_model=embed_model, db=db)
+    hits = rerank_hits_by_question_overlap(rq, hits)
+    hits = boost_hits_by_topic_keywords(question, hits, nlu)
+    hits = filter_cross_crop_hits(question, hits, nlu)
+    row = effective_crop_topic_rule(question, nlu)
+    if row and _topic_good_count(question, hits, nlu) == 0:
+        tail_parts = list(row["needles"][: min(5, len(row["needles"]))])
+        if nlu.aspect == "altitude" or "ከፍታ" in question:
+            tail_parts.append("ከፍታ")
+        if nlu.aspect == "price":
+            tail_parts.extend(["ዋጋ", "ገበያ"])
+        if nlu.aspect == "rainfall":
+            tail_parts.append("ዝናብ")
+        if nlu.aspect == "soil":
+            tail_parts.append("አፈር")
+        if nlu.aspect == "fertilizer":
+            tail_parts.append("ማዳበሪያ")
+        tail = " ".join(dict.fromkeys(tail_parts))
+        rq_boost = f"{rq.strip()}\n{tail}".strip()
+        hits = topic_vector_refine_retrieve(
+            rq_boost, collection, embed_model, db, pool_k, hits
+        )
+        hits = rerank_hits_by_question_overlap(rq_boost, hits)
+        hits = boost_hits_by_topic_keywords(question, hits, nlu)
+        hits = filter_cross_crop_hits(question, hits, nlu)
+    hits = hits[:top_k]
+    return hits, rq
 
 
 def build_rag_pack(
@@ -350,10 +592,10 @@ def build_rag_pack(
             f"Warning: RAG_EMBED_MODEL={env_m!r} != indexed {embed_model!r}; using indexed model.",
             file=sys.stderr,
         )
-    rq = retrieval_query_for(question, conversation)
-    hits = retrieve(collection, rq, top_k=top_k, embed_model=embed_model, db=db)
-    hits = rerank_hits_by_question_overlap(rq, hits)
-    hits = boost_hits_by_topic_keywords(question, hits)
+    nlu = parse_farmer_nlu(question)
+    hits, rq = retrieve_ranked_hits(
+        question, collection, db, top_k, embed_model, conversation, nlu
+    )
     extra_ctx, tool_trace = augment_kb_context(question, hits, fast=fast)
     base_max = int(os.environ.get("RAG_CONTEXT_CHARS", "4200" if fast else "9000"))
     reserved = min(len(extra_ctx) + 400, 3600) if extra_ctx.strip() else 0
@@ -361,20 +603,11 @@ def build_rag_pack(
     ctx = build_context(hits, max_chars=max_chars, compact=fast)
     has_aux = bool(extra_ctx.strip())
     aux_block = f"ተጨማሪ (ድር / መሳሪያ — ከመመሪያ ቤት ይለያል፤ [W1] …)፦\n{extra_ctx}\n\n" if has_aux else ""
+    # Keep user message short: long Amharic tails were echoed by the model as «answers».
     user_block = (
         f"ጥያቄ፦ {question.strip()}\n\n"
-        f"መረጃ (እያንዳንዱ ክፍል በ [1] [2] … ተቆጥሯል)፦\n{ctx}\n\n"
+        f"መረጃ፦\n{ctx}\n\n"
         f"{aux_block}"
-        "በአማርኛ ግልጽ መልስ። ከላይ ካለው መረጃ ብቻ። ከፍለጋው ጋር የሚጣቀሱ ክፍሎችን ቅድሚያ ስጥ። "
-        "ምንጭ ካስፈለገ በመጨረሻ አጭር ጥቅስ ከ [1] ወይም [2] ጋር አዛምድ።"
-        if fast
-        else (
-            f"ጥያቄ፦ {question.strip()}\n\n"
-            f"የማመሳከሪያ መረጃ ከመመሪያ ቤት፦\n{ctx}\n\n"
-            f"{aux_block}"
-            "ከላይ ባለው መረጃ መሰረት ጥያቄውን በአማርኛ መልስ። "
-            "የእያንዳንዱን ክፍል ምንጭ በቁጥር [1] [2] ወይም [W1] ጥቅስ።"
-        )
     )
     retrieval = (
         "hybrid"
@@ -388,6 +621,11 @@ def build_rag_pack(
         "tool_trace": tool_trace,
         "has_aux_context": has_aux,
         "retrieval_query": rq,
+        "nlu": {
+            "crop_id": nlu.crop_id,
+            "aspect": nlu.aspect,
+            "retrieval_boost": nlu.retrieval_boost or None,
+        },
     }
 
 
@@ -522,20 +760,19 @@ def run_query(
                 f"Warning: RAG_EMBED_MODEL={env_m!r} != indexed {embed_model!r}; using indexed model.",
                 file=sys.stderr,
             )
-        rq = retrieval_query_for(question, conversation)
-        hits = retrieve(
-            collection,
-            rq,
-            top_k=top_k,
-            embed_model=embed_model,
-            db=db,
+        nlu = parse_farmer_nlu(question)
+        hits, rq = retrieve_ranked_hits(
+            question, collection, db, top_k, embed_model, conversation, nlu
         )
-        hits = rerank_hits_by_question_overlap(rq, hits)
-        hits = boost_hits_by_topic_keywords(question, hits)
-        return {
+        out = {
             "question": question,
             "answer": "",
             "retrieval_only": True,
+            "nlu": {
+                "crop_id": nlu.crop_id,
+                "aspect": nlu.aspect,
+                "retrieval_boost": nlu.retrieval_boost or None,
+            },
             "retrieval": (
                 "hybrid"
                 if hits and hits[0].get("rrf_rank") is not None
@@ -552,6 +789,9 @@ def run_query(
                 for h in hits
             ],
         }
+        if rq.strip() != question.strip():
+            out["retrieval_query_used"] = rq[:1200]
+        return out
 
     pack = build_rag_pack(
         question, db, top_k, fast=fast, conversation=conversation
@@ -564,6 +804,7 @@ def run_query(
         fast,
         has_aux_context=has_aux,
         follow_up=bool(conversation),
+        nlu=parse_farmer_nlu(question),
     )
     msgs = _ollama_messages(system, conversation, user_block)
     backend = effective_llm_backend()
@@ -609,12 +850,15 @@ def run_query(
     except Exception as e:
         answer = f"[{backend}]\n{e}"
 
+    answer = sanitize_chat_answer(answer)
+
     out: dict = {
         "question": question,
         "answer": answer,
         "retrieval": pack["retrieval"],
         "tool_trace": pack.get("tool_trace") or [],
         "llm_backend": backend,
+        "nlu": pack.get("nlu"),
     }
     rq_used = (pack.get("retrieval_query") or "").strip()
     if rq_used and rq_used != question.strip():
@@ -649,6 +893,7 @@ def stream_rag_answer(
             fast,
             has_aux_context=has_aux,
             follow_up=bool(conversation),
+            nlu=parse_farmer_nlu(question),
         )
         msgs = _ollama_messages(system, conversation, user_block)
         backend = effective_llm_backend()

@@ -12,7 +12,7 @@ from pathlib import Path
 import streamlit as st
 
 from llm_providers import effective_llm_backend, load_dotenv_if_present
-from query import default_top_k, rag_runtime_env, stream_rag_answer
+from query import default_top_k, rag_runtime_env, sanitize_chat_answer, stream_rag_answer
 
 load_dotenv_if_present()
 
@@ -150,7 +150,7 @@ if prompt:
                 yield t
 
         streamed = st.write_stream(tracked())
-    full = (streamed or "").strip() or "".join(chunks).strip()
+    full = sanitize_chat_answer((streamed or "").strip() or "".join(chunks).strip())
     st.session_state.messages.append(
         {"role": "assistant", "content": (full or "").strip(), "sources": sources}
     )
