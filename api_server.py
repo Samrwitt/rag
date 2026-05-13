@@ -19,7 +19,10 @@ from pydantic import BaseModel, Field
 
 import chromadb
 
+from llm_providers import effective_llm_backend, load_dotenv_if_present
 from query import default_top_k, run_query
+
+load_dotenv_if_present()
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "chroma_amharic"
@@ -29,7 +32,7 @@ app = FastAPI(
     version="1.0.0",
     description=(
         "Retrieve + generate over the local Chroma index (PDFs, merged.json Q&A, optional dynamic chunks). "
-        "Requires a built index: ``python ingest.py``. Ollama or OpenAI-compatible API as configured in env."
+        "Requires a built index: ``python ingest.py``. LLM: Groq / Gemini / Ollama / OpenAI via env (see ``GET /v1/llm``)."
     ),
 )
 app.add_middleware(
@@ -63,6 +66,12 @@ class QueryRequest(BaseModel):
         None,
         description="Prior user/assistant turns for multi-turn chat",
     )
+
+
+@app.get("/v1/llm", tags=["Health"])
+def v1_llm() -> dict:
+    """Resolved backend after ``RAG_LLM_BACKEND`` / API keys (same logic as ``query.run_query``)."""
+    return {"llm_backend": effective_llm_backend()}
 
 
 @app.get("/health", tags=["Health"])

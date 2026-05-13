@@ -1,14 +1,15 @@
-"""Query Amharic RAG: retrieve from Chroma + answer via Ollama or OpenAI-compatible API.
+"""Query Amharic RAG: retrieve from Chroma + answer via Groq, Gemini, Ollama (Qwen), or OpenAI.
 
 Retrieval: dense embeddings (Chroma) + optional BM25 sidecar with RRF fusion (see hybrid_retrieval).
-Optional web/tools: see rag_tools/augment.py (RAG_TOOLS, RAG_WEB_MODE, !web / !weather prefixes).
-Optional dynamic_layer: run ``python dynamic_layer.py`` then ``python ingest.py`` merges ``data/chunks/dynamic_context_chunks.jsonl`` when present (``--no-dynamic`` to skip).
+LLM routing: ``RAG_LLM_BACKEND`` (auto|groq|gemini|ollama|openai); keys from ``.env`` (see llm_providers).
+Optional web/tools: rag_tools/augment.py. Optional dynamic_layer JSONL via ingest.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import os
 import sys
 from contextlib import contextmanager
@@ -18,8 +19,18 @@ import chromadb
 import httpx
 
 from embeddings import encode_query
+from llm_providers import (
+    effective_llm_backend,
+    gemini_chat_messages,
+    groq_chat_messages,
+    iter_groq_chat,
+    load_dotenv_if_present,
+    openai_style_chat,
+)
 from qa_context import qa_context_text
 from rag_tools import augment_kb_context
+
+load_dotenv_if_present()
 
 # Short system line in fast mode saves prompt tokens / latency
 SYSTEM_AM = (
@@ -29,8 +40,9 @@ SYSTEM_AM = (
     "የእያንዳንዱን ክፍል ምንጭ በመግለጽ በቁጥር ጥቅስ (ለምሳሌ፦ «…» [1])።"
 )
 SYSTEM_AM_FAST = (
-    "በአማርኛ ትክክለኛ መልስ ስጥ። መረጃውን ብቻ ተጠቀም። ከውጭ ከሆነ በግልጽ ብቻ ንገር። "
-    "አስፈላጊ ከሆነ ከመረጃው ጋር በሚስማማ ቁጥር [1] [2] ጥቅስ።"
+    "በአማርኛ ቀጥተኛ መልስ ስጥ። የተሰጠውን መረጃ ብቻ ተጠቀም። ከውጭ ከሆነ በግልጽ ብቻ ንገር። "
+    "ጥያቄውን በሙሉ በአማርኛ ግልጽ አብራራ። ምንጭ ካስፈለገ በመጨረሻ አጭር ጥቅስ ከ [1] ወይም [2] ከላይ ካለው ክፍል ጋር አጣምር። "
+    "የሰንጠረይ፣ |፣ ^፣ [[፣ ወይም ረዥም የቁጥር ዝርዝሮችን አትጻፍ።"
 )
 SYSTEM_AUX_WEB = (
     " ከ[1] የሚጀመሩ ክፍሎች ከየእኛ መመሪያ ቤት ናቸው። [W1] … ከድር ወይም ከመሳሪያ ሲሆኑ "
@@ -76,8 +88,8 @@ def default_top_k(fast: bool) -> int:
 def default_chat_model(fast: bool) -> str:
     if os.environ.get("OLLAMA_MODEL", "").strip():
         return os.environ["OLLAMA_MODEL"].strip()
-    # ~3s target: small Amharic-tuned 1B. Quality: larger multilingual model.
-    return "amharic-llama-1b-safe:latest" if fast else "qwen3:4b-instruct"
+    # Default to Qwen when using local Ollama (override with OLLAMA_MODEL).
+    return "qwen2.5:3b" if fast else "qwen3:4b-instruct"
 
 
 @contextmanager
@@ -109,10 +121,11 @@ def ollama_options(fast: bool) -> dict:
             print("Warning: OLLAMA_OPTIONS_JSON invalid JSON, using preset.", file=sys.stderr)
     if fast:
         return {
-            "temperature": 0.08,
-            "top_p": 0.85,
+            "temperature": 0.06,
+            "top_p": 0.82,
+            "repeat_penalty": 1.12,
             "num_ctx": int(os.environ.get("OLLAMA_NUM_CTX", "3072")),
-            "num_predict": int(os.environ.get("OLLAMA_NUM_PREDICT", "280")),
+            "num_predict": int(os.environ.get("OLLAMA_NUM_PREDICT", "240")),
         }
     # Smaller default ctx avoids Ollama 500 (VRAM/RAM) on laptops with iGPU + 4B models
     return {
@@ -161,7 +174,7 @@ def retrieve(
     return rows
 
 
-def build_context(chunks: list[dict], max_chars: int) -> str:
+def build_context(chunks: list[dict], max_chars: int, *, compact: bool = False) -> str:
     parts: list[str] = []
     n = 0
     for i, c in enumerate(chunks, 1):
@@ -172,7 +185,8 @@ def build_context(chunks: list[dict], max_chars: int) -> str:
         head = f"[{i}] ምንጭ: {src}"
         if kind == "pdf" and page:
             head += f" ገጽ {page}"
-        head += f" — ለመልስ ውስጥ ጥቅስ: [{i}]"
+        if not compact:
+            head += f" — ለመልስ: [{i}]"
         block = f"{head}\n{c['text']}\n"
         if n + len(block) > max_chars:
             break
@@ -230,6 +244,94 @@ def retrieval_query_for(question: str, conversation: list[dict] | None) -> str:
     return blob.strip()
 
 
+_TOKEN_RE = re.compile(r"[\w\u1200-\u137F]{2,}")
+
+
+def question_overlap_tokens(question: str) -> list[str]:
+    """Amharic / word-ish tokens (length ≥2) for lexical reranking."""
+    toks = _TOKEN_RE.findall(question or "")
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in toks:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out[:28]
+
+
+def rerank_hits_by_question_overlap(query_for_overlap: str, hits: list[dict]) -> list[dict]:
+    """Prefer chunks whose text (or QA question) shares tokens with the overlap string."""
+    if not hits:
+        return hits
+    if os.environ.get("RAG_RERANK_Q_OVERLAP", "1").strip().lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        return hits
+    toks = question_overlap_tokens(query_for_overlap)
+    if len(toks) < 2:
+        return hits
+
+    def key_pair(idx_h: tuple[int, dict]) -> tuple:
+        idx, h = idx_h
+        meta = h.get("meta") or {}
+        blob = (h.get("text") or "") + " " + str(meta.get("question") or "")
+        overlap = sum(1 for t in toks if t in blob)
+        rrf = h.get("rrf_rank")
+        try:
+            rr = int(rrf) if rrf is not None else 9999
+        except (TypeError, ValueError):
+            rr = 9999
+        dist = h.get("distance")
+        try:
+            d = float(dist) if dist is not None else 1e9
+        except (TypeError, ValueError):
+            d = 1e9
+        return (-overlap, rr, d, idx)
+
+    indexed = list(enumerate(hits))
+    indexed.sort(key=key_pair)
+    return [h for _, h in indexed]
+
+
+def boost_hits_by_topic_keywords(question: str, hits: list[dict]) -> list[dict]:
+    """Move crop/topic-specific chunks first when the question names a crop (Amharic)."""
+    if not hits or os.environ.get("RAG_TOPIC_BOOST", "1").strip().lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        return hits
+    q = question or ""
+    # (any of these in question) -> chunk must contain at least one needle to be "on-topic"
+    rules: list[tuple[tuple[str, ...], tuple[str, ...]]] = [
+        (("ለቡና", "ቡና", "ቡናን"), ("ቡና", "ለቡና", "ጎማ", "coffee")),
+        (("ስንዴ",), ("ስንዴ", "wheat")),
+        (("ሰሊጥ", "ሰሊት"), ("ሰሊጥ", "ሰሊት", "sesame")),
+        (("ገብስ",), ("ገብስ", "barley")),
+        (("ቡቃያ",), ("ቡቃያ",)),
+        (("ድንች",), ("ድንች", "potato")),
+    ]
+    for triggers, needles in rules:
+        if not any(t in q for t in triggers):
+            continue
+        on_topic: list[dict] = []
+        rest: list[dict] = []
+        for h in hits:
+            meta = h.get("meta") or {}
+            blob = (h.get("text") or "") + " " + str(meta.get("question") or "")
+            if any(n in blob for n in needles):
+                on_topic.append(h)
+            else:
+                rest.append(h)
+        if on_topic:
+            return on_topic + rest
+    return hits
+
+
 def build_rag_pack(
     question: str,
     db: Path,
@@ -250,18 +352,21 @@ def build_rag_pack(
         )
     rq = retrieval_query_for(question, conversation)
     hits = retrieve(collection, rq, top_k=top_k, embed_model=embed_model, db=db)
+    hits = rerank_hits_by_question_overlap(rq, hits)
+    hits = boost_hits_by_topic_keywords(question, hits)
     extra_ctx, tool_trace = augment_kb_context(question, hits, fast=fast)
     base_max = int(os.environ.get("RAG_CONTEXT_CHARS", "4200" if fast else "9000"))
     reserved = min(len(extra_ctx) + 400, 3600) if extra_ctx.strip() else 0
     max_chars = max(900, base_max - reserved)
-    ctx = build_context(hits, max_chars=max_chars)
+    ctx = build_context(hits, max_chars=max_chars, compact=fast)
     has_aux = bool(extra_ctx.strip())
     aux_block = f"ተጨማሪ (ድር / መሳሪያ — ከመመሪያ ቤት ይለያል፤ [W1] …)፦\n{extra_ctx}\n\n" if has_aux else ""
     user_block = (
         f"ጥያቄ፦ {question.strip()}\n\n"
-        f"መረጃ ከመመሪያ ቤት (ቁጥር [1] [2] …)፦\n{ctx}\n\n"
+        f"መረጃ (እያንዳንዱ ክፍል በ [1] [2] … ተቆጥሯል)፦\n{ctx}\n\n"
         f"{aux_block}"
-        "በአማርኛ አጫጭን መልስ ስጥ፤ ከመረጃ የወጡ ክፍሎችን በ [1] ወይም [2]፣ ከተጨማሪው በ [W1] … አድርግ።"
+        "በአማርኛ ግልጽ መልስ። ከላይ ካለው መረጃ ብቻ። ከፍለጋው ጋር የሚጣቀሱ ክፍሎችን ቅድሚያ ስጥ። "
+        "ምንጭ ካስፈለገ በመጨረሻ አጭር ጥቅስ ከ [1] ወይም [2] ጋር አዛምድ።"
         if fast
         else (
             f"ጥያቄ፦ {question.strip()}\n\n"
@@ -397,31 +502,6 @@ def ollama_chat(
     )
 
 
-def openai_compatible_chat(
-    base_url: str,
-    api_key: str,
-    model: str,
-    user_prompt: str,
-) -> str:
-    url = base_url.rstrip("/") + "/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}"}
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_AM},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0.1,
-    }
-    with httpx.Client(timeout=120.0) as client:
-        r = client.post(url, json=payload, headers=headers)
-        r.raise_for_status()
-        data = r.json()
-    choice = (data.get("choices") or [{}])[0]
-    msg = choice.get("message") or {}
-    return (msg.get("content") or "").strip()
-
-
 def run_query(
     question: str,
     db: Path,
@@ -442,13 +522,16 @@ def run_query(
                 f"Warning: RAG_EMBED_MODEL={env_m!r} != indexed {embed_model!r}; using indexed model.",
                 file=sys.stderr,
             )
+        rq = retrieval_query_for(question, conversation)
         hits = retrieve(
             collection,
-            retrieval_query_for(question, conversation),
+            rq,
             top_k=top_k,
             embed_model=embed_model,
             db=db,
         )
+        hits = rerank_hits_by_question_overlap(rq, hits)
+        hits = boost_hits_by_topic_keywords(question, hits)
         return {
             "question": question,
             "answer": "",
@@ -477,43 +560,61 @@ def run_query(
     user_block = pack["user_block"]
     has_aux = bool(pack.get("has_aux_context"))
 
-    use_ollama = os.environ.get("USE_OLLAMA", "1").strip() in ("1", "true", "yes")
+    system = system_for_rag(
+        fast,
+        has_aux_context=has_aux,
+        follow_up=bool(conversation),
+    )
+    msgs = _ollama_messages(system, conversation, user_block)
+    backend = effective_llm_backend()
     answer = ""
+    hosted_timeout = float(os.environ.get("RAG_HOSTED_HTTP_TIMEOUT", "120" if fast else "240"))
 
-    if use_ollama:
-        base = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
-        model = default_chat_model(fast)
-        opts = ollama_options(fast)
-        system = system_for_rag(
-            fast,
-            has_aux_context=has_aux,
-            follow_up=bool(conversation),
-        )
-        timeout = float(os.environ.get("OLLAMA_HTTP_TIMEOUT", "120" if fast else "300"))
-        msgs = _ollama_messages(system, conversation, user_block)
-        try:
-            answer = ollama_chat_messages(
-                msgs, model, base, options=opts, timeout_sec=timeout
-            )
-        except RuntimeError as e:
-            answer = f"[Ollama]\n{e}"
-    else:
-        base = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com")
-        key = os.environ.get("OPENAI_API_KEY", "")
-        model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-        if not key:
-            answer = (
-                "ምንም LLM አልተዋቀረም። Ollama ለመጠቀም USE_OLLAMA=1 ያድርጉ ወይም "
-                "USE_OLLAMA=0 እና OPENAI_API_KEY ያስገቡ።"
-            )
+    try:
+        if backend == "groq":
+            answer = groq_chat_messages(msgs, fast=fast, timeout_sec=hosted_timeout)
+        elif backend == "gemini":
+            answer = gemini_chat_messages(msgs, fast=fast, timeout_sec=hosted_timeout)
+        elif backend == "openai":
+            base = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com")
+            key = os.environ.get("OPENAI_API_KEY", "").strip()
+            model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+            if not key:
+                answer = "OPENAI_API_KEY አልተዋቀረም። RAG_LLM_BACKEND=groq ወይም gemini ይሞክሩ።"
+            else:
+                answer = openai_style_chat(
+                    msgs,
+                    base_url=base,
+                    api_key=key,
+                    model=model,
+                    timeout_sec=hosted_timeout,
+                )
         else:
-            answer = openai_compatible_chat(base, key, model, user_block)
+            # ollama (local Qwen / etc.)
+            if os.environ.get("USE_OLLAMA", "1").strip() not in ("1", "true", "yes"):
+                answer = (
+                    "USE_OLLAMA=0 ነው። RAG_LLM_BACKEND=groq ወይም gemini ይመርጡ ወይም USE_OLLAMA=1 ያድርጉ።"
+                )
+            else:
+                base = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
+                model = default_chat_model(fast)
+                opts = ollama_options(fast)
+                timeout = float(os.environ.get("OLLAMA_HTTP_TIMEOUT", "120" if fast else "300"))
+                try:
+                    answer = ollama_chat_messages(
+                        msgs, model, base, options=opts, timeout_sec=timeout
+                    )
+                except RuntimeError as e:
+                    answer = f"[Ollama]\n{e}"
+    except Exception as e:
+        answer = f"[{backend}]\n{e}"
 
     out: dict = {
         "question": question,
         "answer": answer,
         "retrieval": pack["retrieval"],
         "tool_trace": pack.get("tool_trace") or [],
+        "llm_backend": backend,
     }
     rq_used = (pack.get("retrieval_query") or "").strip()
     if rq_used and rq_used != question.strip():
@@ -544,35 +645,49 @@ def stream_rag_answer(
     has_aux = bool(pack.get("has_aux_context"))
 
     def _gen():
-        use_ollama = os.environ.get("USE_OLLAMA", "1").strip() in ("1", "true", "yes")
         system = system_for_rag(
             fast,
             has_aux_context=has_aux,
             follow_up=bool(conversation),
         )
-        if not use_ollama:
-            base = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com")
-            key = os.environ.get("OPENAI_API_KEY", "")
-            model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-            if not key:
-                yield (
-                    "ምንም LLM አልተዋቀረም። Ollama ለመጠቀም USE_OLLAMA=1 ያድርጉ ወይም "
-                    "USE_OLLAMA=0 እና OPENAI_API_KEY ያስገቡ።"
-                )
-                return
-            yield openai_compatible_chat(base, key, model, user_block)
-            return
-        base = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
-        model = default_chat_model(fast)
-        opts = ollama_options(fast)
-        timeout = float(os.environ.get("OLLAMA_HTTP_TIMEOUT", "120" if fast else "300"))
         msgs = _ollama_messages(system, conversation, user_block)
+        backend = effective_llm_backend()
+        hosted_timeout = float(os.environ.get("RAG_HOSTED_HTTP_TIMEOUT", "120" if fast else "240"))
         try:
-            yield from iter_ollama_chat(
-                msgs, model, base, options=opts, timeout_sec=timeout
-            )
-        except (RuntimeError, httpx.HTTPError, httpx.RequestError) as e:
-            yield f"[Ollama]\n{e}"
+            if backend == "groq":
+                yield from iter_groq_chat(msgs, fast=fast, timeout_sec=hosted_timeout)
+            elif backend == "gemini":
+                yield gemini_chat_messages(msgs, fast=fast, timeout_sec=hosted_timeout)
+            elif backend == "openai":
+                base = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com")
+                key = os.environ.get("OPENAI_API_KEY", "").strip()
+                model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+                if not key:
+                    yield "OPENAI_API_KEY አልተዋቀረም።"
+                    return
+                yield openai_style_chat(
+                    msgs,
+                    base_url=base,
+                    api_key=key,
+                    model=model,
+                    timeout_sec=hosted_timeout,
+                )
+            else:
+                if os.environ.get("USE_OLLAMA", "1").strip() not in ("1", "true", "yes"):
+                    yield "USE_OLLAMA=0 — RAG_LLM_BACKEND=groq ወይም gemini ይጠቀሙ።"
+                    return
+                base = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
+                model = default_chat_model(fast)
+                opts = ollama_options(fast)
+                timeout = float(os.environ.get("OLLAMA_HTTP_TIMEOUT", "120" if fast else "300"))
+                try:
+                    yield from iter_ollama_chat(
+                        msgs, model, base, options=opts, timeout_sec=timeout
+                    )
+                except (RuntimeError, httpx.HTTPError, httpx.RequestError) as e:
+                    yield f"[Ollama]\n{e}"
+        except Exception as e:
+            yield f"[{backend}]\n{e}"
 
     return sources, pack["retrieval"], _gen
 

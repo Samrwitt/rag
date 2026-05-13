@@ -1,7 +1,7 @@
 """
 Farmer-friendly chat UI for the Amharic RAG (Streamlit).
 
-Run from project root (Ollama must be running):
+Run from project root (``.env`` for Groq/Gemini keys, or local Ollama):
   cd /home/lenovo/Desktop/RAG && . .venv/bin/activate && streamlit run farmer_chat.py
 """
 
@@ -11,7 +11,10 @@ from pathlib import Path
 
 import streamlit as st
 
+from llm_providers import effective_llm_backend, load_dotenv_if_present
 from query import default_top_k, rag_runtime_env, stream_rag_answer
+
+load_dotenv_if_present()
 
 ROOT = Path(__file__).resolve().parent
 DB = ROOT / "chroma_amharic"
@@ -41,7 +44,12 @@ if "messages" not in st.session_state:
 def _render_message(msg: dict) -> None:
     with st.chat_message(msg["role"]):
         content = msg.get("content") or ""
-        if msg["role"] == "assistant" and content.startswith("[Ollama]"):
+        if msg["role"] == "assistant" and (
+            content.startswith("[Ollama]")
+            or content.startswith("[groq]")
+            or content.startswith("[gemini]")
+            or content.startswith("[openai]")
+        ):
             st.error(content)
         else:
             st.markdown(content)
@@ -59,6 +67,7 @@ def _render_message(msg: dict) -> None:
 
 with st.sidebar:
     st.header("⚙️ ማስተካከያ")
+    st.caption(f"LLM: **{effective_llm_backend()}** · `RAG_LLM_BACKEND` (auto=groq→gemini→ollama)")
     quality = st.toggle(
         "ጥራት ቅድሚያ (የበለጠ ዝርዝር መልስ፣ ቀርጥፍ ይሆናል)",
         value=False,
@@ -90,7 +99,8 @@ with st.sidebar:
         "• ዋናው መረጃ ከመመሪያ እና ከጥያቄ-መልስ ቤት ነው።\n\n"
         "• `!web ፍለጋ` ወይም `!weather Addis Ababa` ለውጫዊ እውቀት።\n\n"
         "• ለህክምና ዕውቀት ብቻ ነው — ከመስክ ባለሙያ ያማካኙ።\n\n"
-        "• `ollama serve` እንደሚሰራ ያረጋግጡ።"
+        "• **Groq / Gemini** ካለ `.env` ውስጥ ቁልፍ፣ በነባሪው ከ Ollama በፊት ይጠቀማሉ።\n\n"
+        "• ለአካባቢ **Ollama** `qwen2.5:3b` / `qwen3:4b-instruct` ይጫኑ።"
     )
     if st.button("ውይይት አጽዳ", type="secondary"):
         st.session_state.messages = []
