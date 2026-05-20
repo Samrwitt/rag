@@ -1,9 +1,10 @@
-"""Query Amharic RAG: retrieve from Chroma + answer via Groq, Gemini, Ollama (Qwen), or OpenAI.
+"""Query Amharic RAG: retrieve from Chroma + answer via Gemini, Groq, Ollama (Qwen), or OpenAI.
 
 Retrieval: dense embeddings (Chroma) + optional BM25 sidecar with RRF fusion (see hybrid_retrieval).
-LLM routing: ``RAG_LLM_BACKEND`` (auto|groq|gemini|ollama|openai); keys from ``.env`` (see llm_providers).
-When ``RAG_LLM_BACKEND=groq`` and Groq returns 429/503/413, answers fall back to Gemini if a key is set
-(``GEMINI_API_KEY`` or ``GOOGLE_API_KEY`` / ``GENAI_API_KEY``; ``GROQ_GEMINI_FALLBACK=0`` disables).
+LLM routing: ``RAG_LLM_BACKEND`` (auto|gemini|groq|ollama|openai); keys from ``.env`` (see llm_providers).
+Auto prefers paid Gemini when ``GEMINI_API_KEY`` / ``GOOGLE_API_KEY`` / ``GENAI_API_KEY`` exists,
+then falls back to free Groq if ``GROQ_API_KEY`` exists and Gemini has a transient/quota/server error
+(``GEMINI_GROQ_FALLBACK=0`` disables). Explicit Groq mode can still fall back to Gemini.
 Hosted prompts are capped (``RAG_HOSTED_MESSAGES_MAX_CHARS``, default 26000) to reduce Groq 413.
 Optional web/tools: rag_tools/augment.py. Optional dynamic_layer JSONL via ingest.
 System prompt adds grounded recommendations and cautious predictions; disable with ``RAG_ADVISOR_PLAYBOOK=0``.
@@ -28,7 +29,7 @@ import httpx
 from embeddings import encode_query
 from llm_providers import (
     effective_llm_backend,
-    gemini_chat_messages,
+    gemini_chat_messages_with_groq_fallback,
     groq_chat_messages_with_gemini_fallback,
     iter_groq_chat_with_gemini_fallback,
     load_dotenv_if_present,
@@ -47,14 +48,15 @@ load_dotenv_if_present()
 
 # Short system line in fast mode saves prompt tokens / latency
 SYSTEM_AM = (
-    "አንተ የኢትዮጵያ ግብርና እና የተፈጥሮ ሀብት ባለሙያ አማካሪ ነህ። "
-    "የተሰጠህን መረጃ ብቻ በመጠቀም በአማርኛ ግልጽና ትክክለኛ መልስ ስጥ። "
+    "አንተ የኢትዮጵያ ግብርና እና የተፈጥሮ ሀብት ባለሙያ ደረጃ ያለው የAI አማካሪ ነህ። "
+    "ሁልጊዜ በአማርኛ መልስ፤ ተጠቃሚው በእንግሊዝኛ ቢጠይቅም መልሱ በአማርኛ ይሁን። "
+    "የተሰጠህን መረጃ በቅድሚያ በመጠቀም ግልጽ፣ ትክክለኛ፣ ተግባራዊ እና እንደ GPT ደረጃ የተደራጀ መልስ ስጥ። "
     "ጥያቄውን እንደ መልስ አታድግም፤ ከመረጃው ቁልፍ ቁጥሮችንና እውቀትን አውጣ። "
     "መልስህ ለተጠቃሚ ቀጥታ የሚነገር ነገር ብቻ ይሁን። የፋይል ስም፣ «ምንጭ፡» ወይም የዚህ ቻት መመሪያ መስመር በመልስ ውስጥ አትጨምር። "
     "ከመረጃው ውጭ ከሆነ በግልጽ 'በዚህ መረጃ ውስጥ መልስ አልተገኘም' በማለት ግልጽ አድርግ።"
 )
 SYSTEM_AM_FAST = (
-    "በአማርኛ ቀጥተኛ መልስ ስጥ። የተሰጠውን መረጃ ብቻ ተጠቀም። ከውጭ ከሆነ በግልጽ ብቻ ንገር። "
+    "ሁልጊዜ በአማርኛ ቀጥተኛ መልስ ስጥ። የተሰጠውን መረጃ በቅድሚያ ተጠቀም። ከውጭ ከሆነ በግልጽ ብቻ ንገር። "
     "ጥያቄውን እንደ መልስ አታድግም፤ ከመረጃው ቁልፍ ቁጥሮችንና እውቀትን በግልጽ አውጣ። "
     "መልስህ ለገበሬው ቀጥታ የሚነገር ነገር ብቻ ይሁን። የፋይል ስም፣ «ምንጭ፡» ወይም የዚህ ቻት መመሪያ መስመር በመልስ ውስጥ አትጨምር። "
     "የሰንጠረይ፣ |፣ ^፣ [[፣ ወይም ረዥም የቁጥር ዝርዝሮችን አትጻፍ።"
@@ -274,6 +276,10 @@ def sanitize_chat_answer(text: str | None) -> str:
     for line in t0.splitlines():
         s = line.strip()
         if re.match(r"^ምንጭ\s*[:፦]", s):
+            continue
+        if "ጥያቄውን እንደ መልስ አታድግም" in s:
+            continue
+        if "ከመረጃው ቁልፍ" in s and ("አውጣ" in s or "በግልጽ" in s):
             continue
         if "ከላይ ካለው መረጃ ቁጥር" in s and ("አውጣ" in s or "አታድግም" in s):
             continue
@@ -968,7 +974,9 @@ def run_query(
                 msgs, fast=fast, timeout_sec=hosted_timeout
             )
         elif backend == "gemini":
-            answer = gemini_chat_messages(msgs, fast=fast, timeout_sec=hosted_timeout)
+            answer, llm_used = gemini_chat_messages_with_groq_fallback(
+                msgs, fast=fast, timeout_sec=hosted_timeout
+            )
         elif backend == "openai":
             base = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com")
             key = os.environ.get("OPENAI_API_KEY", "").strip()
@@ -1064,7 +1072,10 @@ def stream_rag_answer(
                     msgs, fast=fast, timeout_sec=hosted_timeout
                 )
             elif backend == "gemini":
-                yield gemini_chat_messages(msgs, fast=fast, timeout_sec=hosted_timeout)
+                answer, _used = gemini_chat_messages_with_groq_fallback(
+                    msgs, fast=fast, timeout_sec=hosted_timeout
+                )
+                yield answer
             elif backend == "openai":
                 base = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com")
                 key = os.environ.get("OPENAI_API_KEY", "").strip()

@@ -1,8 +1,14 @@
-"""Hosted LLM backends (Groq, Gemini) + helpers. Ollama stays in query.py.
+"""Hosted LLM backends (Gemini, Groq) + helpers. Ollama stays in query.py.
 
-Groq → Gemini: when ``RAG_LLM_BACKEND`` is groq and Groq returns 429/503, ``groq_*_with_gemini_fallback``
-calls Gemini if a Gemini-compatible key is set: ``GEMINI_API_KEY`` (preferred), or ``GOOGLE_API_KEY`` /
-``GENAI_API_KEY`` (disable with ``GROQ_GEMINI_FALLBACK=0``). Also falls back on HTTP 413 if Groq rejects payload size.
+Default hosted routing prefers paid Gemini when a Gemini-compatible key is set:
+``GEMINI_API_KEY`` (preferred), or ``GOOGLE_API_KEY`` / ``GENAI_API_KEY``.
+
+Gemini → Groq: when ``RAG_LLM_BACKEND`` is gemini and Gemini returns a transient/quota/server error,
+``gemini_chat_messages_with_groq_fallback`` calls Groq if ``GROQ_API_KEY`` is set
+(disable with ``GEMINI_GROQ_FALLBACK=0``).
+
+Groq → Gemini is still supported for users who explicitly set ``RAG_LLM_BACKEND=groq``
+(disable with ``GROQ_GEMINI_FALLBACK=0``).
 
 When both hosted calls fail, ``query.py`` can fall back to local Ollama (``RAG_HOSTED_FALLBACK_OLLAMA``).
 Gemini 429: brief retries (``GEMINI_RETRY_ATTEMPTS``) then that Ollama path if enabled.
@@ -59,10 +65,10 @@ def effective_llm_backend() -> str:
     if os.environ.get("RAG_LOCAL_FIRST", "").strip().lower() in ("1", "true", "yes", "ollama"):
         if os.environ.get("USE_OLLAMA", "1").strip().lower() in ("1", "true", "yes"):
             return "ollama"
-    if os.environ.get("GROQ_API_KEY", "").strip():
-        return "groq"
     if gemini_api_key():
         return "gemini"
+    if os.environ.get("GROQ_API_KEY", "").strip():
+        return "groq"
     if os.environ.get("USE_OLLAMA", "1").strip() in ("1", "true", "yes"):
         return "ollama"
     if os.environ.get("OPENAI_API_KEY", "").strip():
@@ -109,7 +115,9 @@ def openai_style_chat(
     model: str,
     timeout_sec: float = 120.0,
 ) -> str:
-    url = base_url.rstrip("/") + "/v1/chat/completions"
+    root = base_url.rstrip("/")
+    suffix = "/chat/completions" if root.endswith("/v1") else "/v1/chat/completions"
+    url = root + suffix
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -290,6 +298,13 @@ def gemini_chat_messages(
             r = client.post(url, json=body)
         if r.status_code == 429 and attempt + 1 < attempts:
             last_detail = (r.text or "")[:2000]
+            quota_exhausted = (
+                "RESOURCE_EXHAUSTED" in last_detail
+                or "Quota exceeded" in last_detail
+                or "quota" in last_detail.lower()
+            )
+            if quota_exhausted and gemini_groq_fallback_enabled():
+                raise RuntimeError(f"Gemini HTTP 429: {last_detail}")
             time.sleep(_gemini_backoff_sec(attempt, last_detail))
             continue
         if r.status_code >= 400:
@@ -316,6 +331,17 @@ def groq_gemini_fallback_enabled() -> bool:
     return bool(gemini_api_key())
 
 
+def gemini_groq_fallback_enabled() -> bool:
+    if os.environ.get("GEMINI_GROQ_FALLBACK", "1").strip().lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        return False
+    return bool(os.environ.get("GROQ_API_KEY", "").strip())
+
+
 def should_fallback_groq_to_gemini(exc: BaseException) -> bool:
     if not groq_gemini_fallback_enabled():
         return False
@@ -327,6 +353,34 @@ def should_fallback_groq_to_gemini(exc: BaseException) -> bool:
             return True
         if "Too Many Requests" in s or "Payload Too Large" in s or "ወሰን" in s:
             return True
+    return False
+
+
+def should_fallback_gemini_to_groq(exc: BaseException) -> bool:
+    if not gemini_groq_fallback_enabled():
+        return False
+    if isinstance(exc, httpx.RequestError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in (408, 409, 429, 500, 502, 503, 504)
+    if isinstance(exc, RuntimeError):
+        s = str(exc)
+        transient_markers = (
+            "HTTP 408",
+            "HTTP 409",
+            "HTTP 429",
+            "HTTP 500",
+            "HTTP 502",
+            "HTTP 503",
+            "HTTP 504",
+            "RESOURCE_EXHAUSTED",
+            "UNAVAILABLE",
+            "Too Many Requests",
+            "quota",
+            "rate limit",
+            "exhausted",
+        )
+        return any(m.lower() in s.lower() for m in transient_markers)
     return False
 
 
@@ -348,6 +402,30 @@ def groq_chat_messages_with_gemini_fallback(
                 gemini_chat_messages(messages, fast=fast, timeout_sec=timeout_sec),
                 "gemini",
             )
+        raise
+
+
+def gemini_chat_messages_with_groq_fallback(
+    messages: list[dict],
+    *,
+    fast: bool,
+    timeout_sec: float,
+) -> tuple[str, str]:
+    """Returns (reply_text, backend_used): ``gemini`` or ``groq`` on Gemini transient failure."""
+    try:
+        return (
+            gemini_chat_messages(messages, fast=fast, timeout_sec=timeout_sec),
+            "gemini",
+        )
+    except (RuntimeError, httpx.HTTPStatusError, httpx.RequestError) as e:
+        if should_fallback_gemini_to_groq(e):
+            try:
+                return (
+                    groq_chat_messages(messages, fast=fast, timeout_sec=timeout_sec),
+                    "groq",
+                )
+            except (RuntimeError, httpx.HTTPError, httpx.RequestError) as ge:
+                raise RuntimeError(f"Gemini failed, then Groq fallback failed.\nGemini: {e}\nGroq: {ge}") from ge
         raise
 
 

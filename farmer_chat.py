@@ -68,8 +68,8 @@ def _render_message(msg: dict) -> None:
 with st.sidebar:
     st.header("⚙️ ማስተካከያ")
     st.caption(
-        f"LLM: **{effective_llm_backend()}** · `RAG_LLM_BACKEND` (auto፡ Groq→Gemini፤ ከ429/503 በኋላ **Ollama** ይሞክራል ከተጫነ። "
-        "`RAG_LOCAL_FIRST=1` ከሆነ በመጀመሪያ **Ollama**። Groq 429 → Gemini → (ስህተት) Ollama።"
+        f"LLM: **{effective_llm_backend()}** · `RAG_LLM_BACKEND` (auto፡ **Gemini** ቅድሚያ፣ Gemini ካልተሳካ **Groq**፣ ከዚያ **Ollama** ከተጫነ። "
+        "`RAG_LOCAL_FIRST=1` ከሆነ በመጀመሪያ **Ollama**።)"
     )
     quality = st.toggle(
         "ጥራት ቅድሚያ (የበለጠ ዝርዝር መልስ፣ ቀርጥፍ ይሆናል)",
@@ -87,13 +87,13 @@ with st.sidebar:
     st.divider()
     tools_on = st.toggle(
         "ድር / መሳሪያ (RAG_TOOLS)",
-        value=False,
-        help="ከበስተኛው በሚከፈትበት ጊዜ RAG_WEB_MODE ይተገበራል። !web … እና !weather … ሁልጊዜ ይሰራሉ።",
+        value=True,
+        help="የገበያ፣ አፈር እና የአየር ሁኔታ ጥያቄዎች ሲያስፈልጉ ይፈልጋሉ እና ይቀመጣሉ። !web … እና !weather … ሁልጊዜ ይሰራሉ።",
     )
     web_mode = st.selectbox(
         "RAG_WEB_MODE",
         ("off", "auto", "always", "if_kb_sparse"),
-        index=0,
+        index=1,
         help="auto: RAG_WEB_AUTO ወይም regex፤ if_kb_sparse: በChroma ርቀት/ቁጥር።",
     )
     st.divider()
@@ -101,10 +101,11 @@ with st.sidebar:
         "**ማስታወሻ**\n\n"
         "• ዋናው መረጃ ከመመሪያ እና ከጥያቄ-መልስ ቤት ነው።\n\n"
         "• መልሶች **ምክር** እና **የወደፊት ግምት** ሊያካትቱ ይችላሉ፤ ከመመሪያው ሲደገፉ ብቻ በጥንቃቄ ይሰጣሉ።\n\n"
+        "• ስለ ገበያ፣ አፈር ወይም የአየር ሁኔታ ወቅታዊ ጥያቄ ሲመጣ መጀመሪያ የተቀመጠውን ይመለከታል፤ ካልተገኘ ድር/መሳሪያ ይጠቀማል እና ያስቀምጣል።\n\n"
         "• `!web ፍለጋ` ወይም `!weather Addis Ababa` ለውጫዊ እውቀት።\n\n"
         "• ለመርዝ፣ ለዕጣዕጅ፣ ለእንስሳ ቀውስ ወይም ለሕጋዊ/ገንዘብ ውሳኔ ከአካባቢ ማራዝሚያ ወይም ባለሙያ ያማካኙ።\n\n"
-        "• **HTTP 429** የየኔት ወሰን/ኮታ ነው (428 አይደለም)። ታሪክ + መመሪያ ቶከን ያቃጣል — `RAG_HOSTED_CHAT_ROUNDS` ነባሪ **3** ዙር ብቻ ወደ API ይላካል፤ ለረጅም ውይይት ቁጥሩን ይጨምሩ (`0` = ሁሉንም)።\n\n"
-        "• ከAPI ውጭ፡ `RAG_LLM_BACKEND=ollama` ወይም `RAG_LOCAL_FIRST=1`። Groq/Gemini ከወሰኑ በኋላ **Ollama** አውቶማቲክ ይሞክራል (`RAG_HOSTED_FALLBACK_OLLAMA=1`)።\n\n"
+        "• **HTTP 429** የኔት/ኮታ ወሰን ነው። Gemini ካልተሳካ Groq ይሞክራል (`GEMINI_GROQ_FALLBACK=1`)፤ ታሪክ + መመሪያ ቶከን ያቃጣል — `RAG_HOSTED_CHAT_ROUNDS` ነባሪ **3** ዙር ብቻ ወደ API ይላካል።\n\n"
+        "• ከAPI ውጭ፡ `RAG_LLM_BACKEND=ollama` ወይም `RAG_LOCAL_FIRST=1`። Gemini/Groq ከወሰኑ በኋላ **Ollama** አውቶማቲክ ይሞክራል (`RAG_HOSTED_FALLBACK_OLLAMA=1`)።\n\n"
         "• ለአካባቢ **Ollama** `qwen2.5:3b` / `qwen3:4b-instruct` ይጫኑ።"
     )
     if st.button("ውይይት አጽዳ", type="secondary"):

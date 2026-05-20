@@ -6,6 +6,7 @@ import os
 import re
 from typing import Any
 
+from rag_tools import demand_store
 from rag_tools import weather as weather_mod
 from rag_tools import web_search as web_mod
 
@@ -35,6 +36,76 @@ def _auto_web_trigger(question: str) -> bool:
         return bool(re.search(patterns, q, flags=re.IGNORECASE))
     except re.error:
         return False
+
+
+def _detect_demand_domain(question: str) -> str | None:
+    q = (question or "").strip().lower()
+    if not q:
+        return None
+    if re.search(r"(weather|forecast|የአየር\s*ሁኔታ|ትንበያ|ዝናብ|rain)", q, re.I):
+        return "weather"
+    if re.search(r"(market|price|demand|ገበያ|ዋጋ|ፍላጎት|ሽያጭ)", q, re.I):
+        return "market"
+    if re.search(r"(soil|fertilizer|አፈር|ማዳበሪያ|ፒኤች|ph|ንጥረ)", q, re.I):
+        return "soil"
+    return None
+
+
+def _extract_weather_location(question: str) -> str | None:
+    q = (question or "").strip()
+    patterns = (
+        r"(?:የአየር\s*ሁኔታ|weather|forecast|ዝናብ)\s*(?:በ|at|in|for)\s*(.+)$",
+        r"(?:በ|at|in)\s*([\w\u1200-\u137F\s-]{2,80})\s*(?:የአየር\s*ሁኔታ|weather|forecast|ዝናብ)",
+    )
+    for pat in patterns:
+        m = re.search(pat, q, flags=re.IGNORECASE)
+        if m:
+            loc = re.sub(r"[?.።!]+$", "", m.group(1).strip())
+            return loc[:120] if loc else None
+    return None
+
+
+def _web_block_for_demand(domain: str, question: str) -> tuple[str, dict[str, Any]]:
+    snippets = web_mod.fetch_web_snippets(
+        question, max_results=int(os.environ.get("RAG_WEB_MAX_RESULTS", "4"))
+    )
+    trace = {"tool": "web_search", "args": {"query": question, "domain": domain}, "results": len(snippets)}
+    if not snippets:
+        return "", trace
+    body = web_mod.format_web_block(snippets, start_index=1)
+    title = {
+        "market": "የገበያ/ፍላጎት ወቅታዊ ፍለጋ",
+        "soil": "የአፈር/ማዳበሪያ ወቅታዊ ፍለጋ",
+    }.get(domain, "ወቅታዊ ፍለጋ")
+    rec = demand_store.put_cached(domain, question, body, source="web_search", metadata=trace)
+    return f"{title} (ከድር፣ ተቀምጧል)፦\n{rec['body']}", trace
+
+
+def _demand_context(question: str) -> tuple[str, list[dict[str, Any]]]:
+    """Fetch/store dynamic weather, market, and soil context when the KB likely needs fresh facts."""
+    trace: list[dict[str, Any]] = []
+    domain = _detect_demand_domain(question)
+    if not domain:
+        return "", trace
+
+    cached = demand_store.get_cached(domain, question)
+    if cached:
+        trace.append({"tool": "demand_cache", "domain": domain, "cache": "hit"})
+        return demand_store.format_cached_block(cached), trace
+
+    if domain == "weather":
+        loc = _extract_weather_location(question)
+        if not loc:
+            trace.append({"tool": "demand_cache", "domain": domain, "cache": "miss", "reason": "missing_location"})
+            return "", trace
+        body = weather_mod.fetch_weather_summary(loc)
+        rec = demand_store.put_cached(domain, question, body, source="Open-Meteo", metadata={"location": loc})
+        trace.append({"tool": "weather_forecast", "args": {"location": loc}, "cache": "stored"})
+        return "የአየር ሁኔታ (Open-Meteo፣ ተቀምጧል)፦\n" + rec["body"], trace
+
+    block, web_trace = _web_block_for_demand(domain, question)
+    trace.append({**web_trace, "cache": "stored" if block else "miss"})
+    return block, trace
 
 
 def _kb_looks_sparse(hits: list[dict], *, min_hits: int = 2, max_dist: float | None = None) -> bool:
@@ -98,8 +169,14 @@ def augment_kb_context(
         blocks.append("የአየር ሁኔታ (Open-Meteo፣ ከውጭ)፦\n" + body)
         return "\n\n".join(blocks), trace
 
+    if _env_flag("RAG_DEMAND_AUTO", "1"):
+        demand_block, demand_trace = _demand_context(q)
+        trace.extend(demand_trace)
+        if demand_block:
+            blocks.append(demand_block)
+
     if not _env_flag("RAG_TOOLS", "0"):
-        return "", trace
+        return "\n\n".join(blocks).strip(), trace
 
     mode = _web_mode()
     want_web = False

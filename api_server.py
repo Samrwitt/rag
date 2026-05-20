@@ -32,7 +32,8 @@ app = FastAPI(
     version="1.0.0",
     description=(
         "Retrieve + generate over the local Chroma index (PDFs, merged.json Q&A, optional dynamic chunks). "
-        "Requires a built index: ``python ingest.py``. LLM: Groq / Gemini / Ollama / OpenAI via env (see ``GET /v1/llm``)."
+        "Requires a built index: ``python ingest.py``. LLM: Gemini first, Groq backup, then optional Ollama/OpenAI via env "
+        "(see ``GET /v1/llm``). Dynamic demand context for weather/market/soil is cached under ``data/dynamic``."
     ),
 )
 app.add_middleware(
